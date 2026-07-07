@@ -1,0 +1,282 @@
+# =============================================================================
+# Networks
+# =============================================================================
+networks:
+  datastack_net:
+    driver: bridge
+
+# =============================================================================
+# Named Volumes
+# =============================================================================
+volumes:
+  postgres_data:
+  superset_home:
+  # ClearML backing stores
+  clearml_mongo:
+  clearml_elastic:
+  clearml_redis:
+  clearml_fileserver:
+  clearml_logs:
+
+# =============================================================================
+# Services
+# =============================================================================
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — hosts superset_db and default postgres db
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    container_name: datastack_postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    networks:
+      - datastack_net
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # ClearML Server — proper multi-service deployment
+  #   mongo + elasticsearch + redis → apiserver → webserver + fileserver
+  # ---------------------------------------------------------------------------
+  clearml-mongo:
+    image: mongo:7.0
+    container_name: datastack_clearml_mongo
+    restart: unless-stopped
+    command: mongod --setParameter internalQueryMaxBlockingSortMemoryUsageBytes=268435456
+    volumes:
+      - clearml_mongo:/data/db
+    networks:
+      datastack_net:
+        aliases:
+          - mongo
+    healthcheck:
+      test: ["CMD", "mongosh", "--eval", "db.adminCommand('ping')"]
+      interval: 15s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+
+  clearml-elastic:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.13.0
+    container_name: datastack_clearml_elastic
+    restart: unless-stopped
+    environment:
+      node.name: clearml-elastic
+      cluster.name: clearml
+      discovery.type: single-node
+      bootstrap.memory_lock: "true"
+      xpack.security.enabled: "false"
+      ES_JAVA_OPTS: "-Xms1g -Xmx1g"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65535
+        hard: 65535
+    volumes:
+      - clearml_elastic:/usr/share/elasticsearch/data
+    networks:
+      datastack_net:
+        aliases:
+          - elasticsearch
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:9200/_cluster/health | grep -qE '\"status\":\"(green|yellow)\"'"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  clearml-redis:
+    image: redis:7-alpine
+    container_name: datastack_clearml_redis
+    restart: unless-stopped
+    networks:
+      datastack_net:
+        aliases:
+          - redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clearml-apiserver:
+    image: clearml/server:latest
+    container_name: datastack_clearml_apiserver
+    restart: unless-stopped
+    command: apiserver
+    ports:
+      - "8008:8008"
+    environment:
+      CLEARML_ELASTIC_SERVICE_HOST: clearml-elastic
+      CLEARML_ELASTIC_SERVICE_PORT: 9200
+      CLEARML_MONGODB_SERVICE_HOST: clearml-mongo
+      CLEARML_MONGODB_SERVICE_PORT: 27017
+      CLEARML_REDIS_SERVICE_HOST: clearml-redis
+      CLEARML_REDIS_SERVICE_PORT: 6379
+      CLEARML_SERVER_DEPLOYMENT_TYPE: linux
+      CLEARML__apiserver__pre_populate__enabled: "true"
+      CLEARML__secure__credentials__services_agent__user_key: "DEVACCESSKEY00000001"
+      CLEARML__secure__credentials__services_agent__user_secret: "devsecretkey000000000000000001"
+    volumes:
+      - clearml_fileserver:/mnt/fileserver
+      - clearml_logs:/var/log/clearml
+      - ./clearml-config/auth.conf:/opt/clearml/config/auth.conf:ro
+    networks:
+      datastack_net:
+        aliases:
+          - apiserver
+    depends_on:
+      clearml-mongo:
+        condition: service_healthy
+      clearml-elastic:
+        condition: service_healthy
+      clearml-redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8008/v2.1/debug.ping | grep -q 'ClearML server' || exit 1"]
+      interval: 20s
+      timeout: 10s
+      retries: 10
+      start_period: 60s
+
+  clearml-fileserver:
+    image: clearml/server:latest
+    container_name: datastack_clearml_fileserver
+    restart: unless-stopped
+    command: fileserver
+    ports:
+      - "8081:8081"
+    environment:
+      CLEARML_ELASTIC_SERVICE_HOST: clearml-elastic
+      CLEARML_ELASTIC_SERVICE_PORT: 9200
+      CLEARML_MONGODB_SERVICE_HOST: clearml-mongo
+      CLEARML_MONGODB_SERVICE_PORT: 27017
+      CLEARML_REDIS_SERVICE_HOST: clearml-redis
+      CLEARML_REDIS_SERVICE_PORT: 6379
+    volumes:
+      - clearml_fileserver:/mnt/fileserver
+      - clearml_logs:/var/log/clearml
+    networks:
+      datastack_net:
+        aliases:
+          - fileserver
+    depends_on:
+      clearml-apiserver:
+        condition: service_healthy
+
+  clearml-webserver:
+    image: clearml/server:latest
+    container_name: datastack_clearml_webserver
+    restart: unless-stopped
+    command: webserver
+    ports:
+      - "8080:80"
+    environment:
+      CLEARML_API_HOST: http://clearml-apiserver:8008
+      CLEARML_FILES_HOST: http://clearml-fileserver:8081
+    networks:
+      - datastack_net
+    depends_on:
+      - clearml-apiserver
+      - clearml-fileserver
+
+  # ---------------------------------------------------------------------------
+  # Jupyter Lab — PySpark + ML libraries + ClearML SDK
+  # ---------------------------------------------------------------------------
+  jupyter:
+    image: jupyter/pyspark-notebook:latest
+    container_name: datastack_jupyter
+    restart: unless-stopped
+    user: root
+    ports:
+      - "8888:8888"
+    environment:
+      JUPYTER_TOKEN: ${JUPYTER_TOKEN}
+      JUPYTER_ENABLE_LAB: "yes"
+      GRANT_SUDO: "yes"
+      # ClearML SDK config
+      CLEARML_API_HOST: http://clearml-apiserver:8008
+      CLEARML_WEB_HOST: http://localhost:8080
+      CLEARML_FILES_HOST: http://clearml-fileserver:8081
+      # ClearML API credentials
+      CLEARML_API_ACCESS_KEY: DEVACCESSKEY00000001
+      CLEARML_API_SECRET_KEY: "devsecretkey000000000000000001"
+      # Postgres connection helper env vars
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_HOST: ${POSTGRES_HOST}
+      POSTGRES_PORT: ${POSTGRES_PORT}
+      SPARK_JDBC_JAR: /home/jovyan/jars/postgresql-42.7.3.jar
+    volumes:
+      - ./notebooks:/home/jovyan/notebooks
+      - ./data:/home/jovyan/data
+      - ./models:/home/jovyan/models
+      - ./sql:/home/jovyan/sql
+      - ./clearml-config/clearml.conf:/home/jovyan/clearml.conf:ro
+      - ./jars:/home/jovyan/jars:ro
+    networks:
+      - datastack_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    # Install extra Python packages at startup
+    command: >
+      bash -c "
+        pip install --quiet clearml scikit-learn sqlalchemy psycopg2-binary findspark &&
+        start-notebook.sh --NotebookApp.token='' --NotebookApp.password=''
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8888/api || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  # ---------------------------------------------------------------------------
+  # Apache Superset — BI dashboard
+  # ---------------------------------------------------------------------------
+  superset:
+    image: apache/superset:latest
+    container_name: datastack_superset
+    restart: unless-stopped
+    user: root
+    ports:
+      - "8088:8088"
+    environment:
+      SUPERSET_SECRET_KEY: ${SUPERSET_SECRET_KEY}
+      SQLALCHEMY_DATABASE_URI: postgresql+psycopg2://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/superset_db
+    volumes:
+      - superset_home:/app/superset_home
+    networks:
+      - datastack_net
+    depends_on:
+      postgres:
+        condition: service_healthy
+    entrypoint: >
+      bash -c "
+        /app/.venv/bin/python3 -m ensurepip --upgrade &&
+        /app/.venv/bin/python3 -m pip install psycopg2-binary &&
+        /app/docker/entrypoints/run-server.sh
+      "
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8088/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
